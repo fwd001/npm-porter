@@ -26,7 +26,7 @@ const DEFAULT_CONFIG = {
   lockFile: "./file/pnpm-lock.yaml",
 
   // 2. 项目 package.json 路径 
-  packageFile: "./file/package1.json",
+  packageFile: "./file/package.json",
 
   // 3. 所有 .tgz 包唯一的存放和输出目录
   outputDir: "./_npm_cache",

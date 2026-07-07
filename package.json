@@ -4,7 +4,8 @@
   "description": "(npm 搬运工) — 极简、形象。说明它是一个跨网、两端运输依赖的工具。nexus-cargo",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "sc": "node sync-porter.mjs"
   },
   "keywords": [],
   "author": "wd",
