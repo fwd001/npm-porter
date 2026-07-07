@@ -8,8 +8,8 @@
 
 ### 1. 怎么用？
 
-* **首次全量下载**：把内网项目的 `pnpm-lock.yaml` 和 `package.json` 一起拷到外网脚本的对应目录下，执行命令，全家桶包会被一次性全量下载到 `./_npm_cache`。
-* **后续新增包（增量）**：**删掉外网的 `pnpm-lock.yaml**`，直接在外网的 `package.json` 里手动添加你要的新包名。执行命令后，脚本会自动识别老包并跳过，**只下载你新加的包**到 `./_npm_cache` 里。
+- **首次全量下载**：把内网项目的 `pnpm-lock.yaml` 和 `package.json` 一起拷到外网脚本的对应目录下，执行命令，全家桶包会被一次性全量下载到 `./_npm_cache`。
+- **后续新增包（增量）**：**删掉外网的 `pnpm-lock.yaml**`，直接在外网的 `package.json`里手动添加你要的新包名。执行命令后，脚本会自动识别老包并跳过，**只下载你新加的包**到`./\_npm_cache` 里。
 
 ### 2. 执行命令：
 
@@ -29,11 +29,11 @@ node sync-porter.cjs
 
 1. 把在外网捞出来的新包（`.tgz` 文件）拷贝进内网。
 2. 在正式发布前，确保你在内网终端**手动登录过一次内网 Nexus 宿主库（hosted）**：
+
 ```bash
-npm login --registry=http://你的内网NexusIP:8081/repository/npm-hosted/
+npm login --registry=http://10.1.1.1:8081/repository/npm-hosted/
 
 ```
-
 
 3. 把包丢进脚本指定的输入目录，直接运行发布脚本。
 
@@ -54,11 +54,24 @@ node publish-to-nexus.cjs
 
 ```ini
 # 锁死为内网 Nexus 的组仓库 (group)
-registry=http://你的内网NexusIP:8081/repository/npm-group/
+registry=http://10.1.1.1:8081/repository/npm-group/
 
 ```
 
 配置好后，内网任何人需要安装包，不需要去关心文件在哪，直接在项目里正常敲 **`pnpm install`**，即可秒级从 Nexus 自动拉取安装！
 
+## 其他
+
 下载某个包的命令
-npm pack dayjs --pack-destination ./_npm_cache
+npm pack dayjs --pack-destination ./\_npm_cache
+
+npm login --registry=http://10.1.1.1:8081/repository/npm-hosted/
+
+admin
+Lhcz@0630
+
+# 语法：npm publish <tarball文件路径> --registry=<你的hosted仓库地址>
+
+npm publish supports-color-5.5.0.tgz --registry=http://10.1.1.1:8081/repository/npm-hosted/ --provenance=false --audit=false
+
+pnpm publish --registry http://10.1.1.1:8081/repository/npm-hosted/

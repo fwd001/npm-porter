@@ -8,10 +8,8 @@ const { load } = yaml;
 /* ==========================================================================
  * 📖 【脚本使用说明】
  * ==========================================================================
- * 1. 作用：单目录联合解析下载器。
- * - 首次使用：同时放 pnpm-lock.yaml 和 package.json，拉取全量树进行一键下载。
- * - 增量使用：删掉或不提供 lockfile，仅在 package.json 写入新包，脚本将自动过滤
- * 目标目录中已存在的老包，实现精准的单目录增量追加。
+ * 1. 作用：全版本无损单目录下载器。
+ * - 完美修复了同名包多版本被覆盖的 Bug，严格支持 Lockfile 中同一依赖的全部历史版本下载。
  * 2. 依赖安装：
  * npm install js-yaml
  * 3. 运行方式：
@@ -55,12 +53,10 @@ const WORKDIR = getArg("--output", DEFAULT_CONFIG.outputDir);
 const CONCURRENCY = parseInt(getArg("--concurrency", String(DEFAULT_CONFIG.concurrency)), 10);
 const LOG_FILE = path.resolve(getArg("--log", DEFAULT_CONFIG.logFile));
 
-// 确保输出目录存在 (如果存在则保留，不会清空它)
 if (!fs.existsSync(WORKDIR)) {
   fs.mkdirSync(WORKDIR, { recursive: true });
 }
 
-// 初始化日志
 fs.writeFileSync(LOG_FILE, `=== 离线包下载失败日志 (${new Date().toLocaleString()}) ===\n\n`);
 
 function runAsync(cmd) {
@@ -72,28 +68,33 @@ function runAsync(cmd) {
   });
 }
 
+/* 兼容解析 pnpm 各种大版本的依赖 Key 格式 */
 function parsePackageKey(key) {
+  // pnpm v6 格式: "/uuid/8.3.2" 或带 peer 依赖的 "/@babel/core/7.20.0(@babel/preset-env@7.20.0)"
   if (key.startsWith("/")) {
-    const m = key.match(/^\/(.+)\/([^/]+)$/);
+    // 移除可能存在的括号及其内部的 peer 依赖声明
+    const cleanKey = key.split("(")[0];
+    const m = cleanKey.match(/^\/(.+)\/([^/]+)$/);
     if (!m) return null;
     return { name: m[1], version: m[2] };
   }
-  const index = key.lastIndexOf("@");
+  // pnpm v9/v10 格式: "uuid@8.3.2" 或 "uuid@8.3.2(peerDep)"
+  const cleanKey = key.split("(")[0];
+  const index = cleanKey.lastIndexOf("@");
   if (index <= 0) return null;
-  return { name: key.substring(0, index), version: key.substring(index + 1) };
+  return { name: cleanKey.substring(0, index), version: cleanKey.substring(index + 1) };
 }
 
-/* 核心断点续传/老包校验：支持精准版本和模糊版本匹配 */
+/* 核心断点续传/老包校验：严格区分版本 */
 function isAlreadyDownloaded(name, version, workdir) {
   let cleanName = name.startsWith("@") ? name.substring(1).replace("/", "-") : name;
   
   if (version) {
-    // 1. 如果有具体版本号（来自 Lockfile），直接对齐 npm 命名规则查原件
+    // 1. 如果有具体版本号（来自 Lockfile），直接对齐 npm 命名规则查原件，做到版本隔离
     const expectedFileName = `${cleanName}-${version}.tgz`;
     return fs.existsSync(path.join(workdir, expectedFileName));
   } else {
-    // 2. 如果没有具体版本号（Lock被删后，来自 package.json 的纯新包）
-    // 检索该目录下是否已经有这个包的任意 tgz。如果有，就代表曾经下过，直接跳过
+    // 2. 如果没有具体版本号（增量手写阶段），检索该目录下是否已经有这个包的任意 tgz
     const files = fs.readdirSync(workdir);
     return files.some(file => file.startsWith(`${cleanName}-`) && file.endsWith(".tgz"));
   }
@@ -121,6 +122,7 @@ async function asyncPool(poolLimit, array, iteratorFn) {
  * 主程序
  * ========================================================================== */
 async function main() {
+  // ⭐ 核心修复：使用“name@version”作为唯一 Key，防止同名不同版本的包被覆盖
   const finalDepsMap = new Map();
   let lockCount = 0;
   let pkgCount = 0;
@@ -136,15 +138,19 @@ async function main() {
         const pkg = packages[key];
         if (["directory", "file", "git", "link"].includes(pkg?.resolution?.type)) continue;
 
-        finalDepsMap.set(parsed.name, {
-          name: parsed.name,
-          version: parsed.version,
-          rawDep: `${parsed.name}@${parsed.version}`
-        });
-        lockCount++;
+        // 以唯一标示 name@version 存储
+        const uniqueKey = `${parsed.name}@${parsed.version}`;
+        if (!finalDepsMap.has(uniqueKey)) {
+          finalDepsMap.set(uniqueKey, {
+            name: parsed.name,
+            version: parsed.version,
+            rawDep: uniqueKey
+          });
+          lockCount++;
+        }
       }
     } catch (e) {
-      console.warn("⚠️ 读取 Lock 文件失败，将跳过锁文件解析。");
+      console.warn("⚠️ 读取 Lock 文件失败，将跳过锁文件解析。报错原因:", e.message);
     }
   } else {
     console.log("ℹ️ 未检测到 Lock 文件（已自动切换为纯 package.json 增量模式）。");
@@ -165,17 +171,22 @@ async function main() {
           continue;
         }
 
-        // 核心去重：如果 Lock 提取依赖或者已有合并中包含它，直接跳过
-        if (finalDepsMap.has(name)) {
+        // 检查 Map 中是否已经存在该包的任何一个版本
+        // 增量模式下：只有当 Lockfile 和 Map 里完全没有任何一个版本的该依赖时，才作为全新包引入
+        const hasExisting = Array.from(finalDepsMap.values()).some(item => item.name === name);
+        if (hasExisting) {
           continue;
         }
 
-        finalDepsMap.set(name, {
-          name: name,
-          version: null, // 无确切版本，交由 npm 拉取最新符合条件的包
-          rawDep: versionRange.includes(":") ? name : `${name}@${versionRange}`
-        });
-        pkgCount++;
+        const uniqueKey = `${name}@${versionRange}`;
+        if (!finalDepsMap.has(uniqueKey)) {
+          finalDepsMap.set(uniqueKey, {
+            name: name,
+            version: null, 
+            rawDep: versionRange.includes(":") ? name : uniqueKey
+          });
+          pkgCount++;
+        }
       }
     } catch (e) {
       console.warn("⚠️ 读取 package.json 失败或格式错误。");
@@ -185,9 +196,9 @@ async function main() {
   const depList = Array.from(finalDepsMap.values());
 
   console.log("====================================");
-  console.log(`📑 依赖梳理完成！合并去重后独立依赖共：${depList.length} 个`);
-  console.log(`   └─ 来自 Lockfile 锁定依赖: ${lockCount} 个`);
-  console.log(`   └─ 来自 package.json 补充依赖: ${pkgCount} 个`);
+  console.log(`📑 依赖梳理完成！多版本完美共存后总包数：${depList.length} 个`);
+  console.log(`   └─ 来自 Lockfile 的精确依赖(含多版本): ${lockCount} 个`);
+  console.log(`   └─ 来自 package.json 的新增依赖: ${pkgCount} 个`);
   console.log(`⚡ 当前并发下载数：${CONCURRENCY}`);
   console.log(`📁 目标输出目录：${path.resolve(WORKDIR)}`);
   console.log("====================================");
@@ -201,7 +212,7 @@ async function main() {
 
   // 3. 执行单目录并发下载
   async function processDependency(pkgInfo) {
-    // 智能识别：无论是精准版本还是模糊新包，只要本地 outputDir 已经存在，立刻跳过
+    // 严格的版本级断点续传校验
     if (isAlreadyDownloaded(pkgInfo.name, pkgInfo.version, WORKDIR)) {
       skipped++;
       return;
@@ -210,7 +221,7 @@ async function main() {
     try {
       await runAsync(`npm pack "${pkgInfo.rawDep}" --pack-destination "${WORKDIR}"`);
       success++;
-      console.log(`✅ [下载成功] [${success}]: ${pkgInfo.rawDep}`);
+      console.log(`✅ [下载成功] [${success}/${depList.length}]: ${pkgInfo.rawDep}`);
     } catch (e) {
       failed++;
       console.error(`❌ [下载失败]: ${pkgInfo.rawDep}`);
