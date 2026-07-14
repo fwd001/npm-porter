@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "sc": "node sync-porter.mjs",
-    "pub": "node publish-to-nexus.mjs"
+    "publish": "node publish-to-nexus.mjs"
   },
   "keywords": [],
   "author": "wd",

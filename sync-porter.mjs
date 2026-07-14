@@ -34,6 +34,12 @@ const DEFAULT_CONFIG = {
 
   // 5. 错误日志文件名称与存放路径
   logFile: "./download_errors.log",
+
+  // 6. 旧锁文件路径（可选，用于差异化下载，不配则全量下载）
+  oldLockFile: null,
+
+  // 7. 旧 package.json 路径（可选，用于差异化下载）
+  oldPackageFile: null,
 };
 
 /* ==========================================================================
@@ -52,6 +58,22 @@ const PACKAGE_FILE = getArg("--package", DEFAULT_CONFIG.packageFile);
 const WORKDIR = getArg("--output", DEFAULT_CONFIG.outputDir);
 const CONCURRENCY = parseInt(getArg("--concurrency", String(DEFAULT_CONFIG.concurrency)), 10);
 const LOG_FILE = path.resolve(getArg("--log", DEFAULT_CONFIG.logFile));
+const OLD_LOCK_FILE = getArg("--old-lock", DEFAULT_CONFIG.oldLockFile);
+const OLD_PACKAGE_FILE = getArg("--old-package", DEFAULT_CONFIG.oldPackageFile);
+
+// 读取 .npmrc 中的 registry 地址，支持 --registry CLI 覆盖
+function readNpmrcRegistry() {
+  const npmrcPath = path.resolve("./.npmrc");
+  if (!fs.existsSync(npmrcPath)) return null;
+  try {
+    const content = fs.readFileSync(npmrcPath, "utf8");
+    const match = content.match(/^registry\s*=\s*(.+)$/m);
+    return match ? match[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+const REGISTRY = getArg("--registry", readNpmrcRegistry());
 
 if (!fs.existsSync(WORKDIR)) {
   fs.mkdirSync(WORKDIR, { recursive: true });
@@ -122,10 +144,33 @@ async function asyncPool(poolLimit, array, iteratorFn) {
  * 主程序
  * ========================================================================== */
 async function main() {
-  // ⭐ 核心修复：使用“name@version”作为唯一 Key，防止同名不同版本的包被覆盖
+  // ⭐ 核心修复：使用"name@version"作为唯一 Key，防止同名不同版本的包被覆盖
   const finalDepsMap = new Map();
   let lockCount = 0;
   let pkgCount = 0;
+  let lockSkipped = 0;
+  let pkgSkipped = 0;
+
+  // --- Diff Mode: 解析旧锁文件，构建已存在包的 Set ---
+  let oldPackagesSet = new Set();
+  let isDiffMode = false;
+  if (OLD_LOCK_FILE && fs.existsSync(OLD_LOCK_FILE)) {
+    try {
+      const oldLock = load(fs.readFileSync(OLD_LOCK_FILE, "utf8"));
+      const oldPkgs = oldLock.packages || {};
+      for (const key of Object.keys(oldPkgs)) {
+        const parsed = parsePackageKey(key);
+        if (!parsed) continue;
+        const pkg = oldPkgs[key];
+        if (["directory", "file", "git", "link"].includes(pkg?.resolution?.type)) continue;
+        oldPackagesSet.add(`${parsed.name}@${parsed.version}`);
+      }
+      isDiffMode = true;
+      console.log(`🔍 Diff Mode: 旧锁文件包含 ${oldPackagesSet.size} 个包，将只下载新增/变更的包`);
+    } catch (e) {
+      console.warn("⚠️ 旧锁文件解析失败，回退全量下载:", e.message);
+    }
+  }
 
   // 1. 尝试解析 pnpm-lock.yaml 提取全量深层依赖
   if (fs.existsSync(LOCK_FILE)) {
@@ -140,6 +185,8 @@ async function main() {
 
         // 以唯一标示 name@version 存储
         const uniqueKey = `${parsed.name}@${parsed.version}`;
+        // Diff Mode: 旧锁文件中已存在的包跳过
+        if (isDiffMode && oldPackagesSet.has(uniqueKey)) { lockSkipped++; continue; }
         if (!finalDepsMap.has(uniqueKey)) {
           finalDepsMap.set(uniqueKey, {
             name: parsed.name,
@@ -157,6 +204,24 @@ async function main() {
   }
 
   // 2. 读取 package.json 提取顶层依赖并与 Lock 结果去重合并
+
+  // --- Diff Mode: 解析旧 package.json，构建已有依赖名 Set ---
+  let oldDepNamesSet = new Set();
+  if (isDiffMode && OLD_PACKAGE_FILE && fs.existsSync(OLD_PACKAGE_FILE)) {
+    try {
+      const oldPkg = JSON.parse(fs.readFileSync(OLD_PACKAGE_FILE, "utf8"));
+      const oldCombined = { ...oldPkg.dependencies, ...oldPkg.devDependencies, ...oldPkg.optionalDependencies };
+      for (const name of Object.keys(oldCombined)) {
+        const v = oldCombined[name];
+        if (!v.startsWith("workspace:") && !v.startsWith("link:") && !v.startsWith("file:")) {
+          oldDepNamesSet.add(name);
+        }
+      }
+    } catch (e) {
+      console.warn("⚠️ 旧 package.json 解析失败，跳过 package.json diff:", e.message);
+    }
+  }
+
   if (fs.existsSync(PACKAGE_FILE)) {
     try {
       const pkgJson = JSON.parse(fs.readFileSync(PACKAGE_FILE, "utf8"));
@@ -170,6 +235,9 @@ async function main() {
         if (versionRange.startsWith("workspace:") || versionRange.startsWith("link:") || versionRange.startsWith("file:")) {
           continue;
         }
+
+        // Diff Mode: 旧 package.json 中已存在的依赖跳过
+        if (isDiffMode && oldDepNamesSet.has(name)) { pkgSkipped++; continue; }
 
         // 检查 Map 中是否已经存在该包的任何一个版本
         // 增量模式下：只有当 Lockfile 和 Map 里完全没有任何一个版本的该依赖时，才作为全新包引入
@@ -199,6 +267,9 @@ async function main() {
   console.log(`📑 依赖梳理完成！多版本完美共存后总包数：${depList.length} 个`);
   console.log(`   └─ 来自 Lockfile 的精确依赖(含多版本): ${lockCount} 个`);
   console.log(`   └─ 来自 package.json 的新增依赖: ${pkgCount} 个`);
+  if (isDiffMode) {
+    console.log(`   └─ [DIFF] 旧文件中已存在(跳过): ${lockSkipped + pkgSkipped} 个`);
+  }
   console.log(`⚡ 当前并发下载数：${CONCURRENCY}`);
   console.log(`📁 目标输出目录：${path.resolve(WORKDIR)}`);
   console.log("====================================");
@@ -219,7 +290,7 @@ async function main() {
     }
 
     try {
-      await runAsync(`npm pack "${pkgInfo.rawDep}" --pack-destination "${WORKDIR}"`);
+      await runAsync(`npm pack "${pkgInfo.rawDep}" --pack-destination "${WORKDIR}"${REGISTRY ? ` --registry ${REGISTRY}` : ""}`);
       success++;
       console.log(`✅ [下载成功] [${success}/${depList.length}]: ${pkgInfo.rawDep}`);
     } catch (e) {
